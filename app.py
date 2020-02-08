@@ -1,117 +1,122 @@
-import io
-import json
+from flask import Flask, request, redirect, url_for
+import os
+from werkzeug.utils import secure_filename
+import numpy as np # linear algebra
+import pandas as pd
 import torch
-import base64
-from io import BytesIO
-
-from torchvision import models
-import torchvision.transforms as transforms
-from PIL import Image
-from flask import Flask, jsonify, request
-
-# from pyfcm import FCMNotification
+import torchvision
+from torchvision import transforms
+from tqdm import tqdm
+import shutil 
 
 
-# push_service = FCMNotification(
-#     api_key="AAAAicLngtE:APA91bEMDXGcE5suWeWd5JD1fJY1S2MJHdXMZYl4tbCCiHGfE5nvriAO05svXCJ4rBMd2aaDjtTfv5o0D9lrDfl9e2gKEIK_DbNKeCchESJ8Hk7Uj3FoxXvMa5_HOGAnrX7x60KvoMJ0"
-# )
+class ImageFolderWithPaths(torchvision.datasets.ImageFolder):
+    def __getitem__(self, index):
+        original_tuple = super(ImageFolderWithPaths, self).__getitem__(index)
+        path = self.imgs[index][0]
+        tuple_with_path = (original_tuple + (path,))
+        return tuple_with_path
 
-# # OR initialize with proxies
+ALLOWED_EXTENSIONS=set(['jpg', 'jpeg'])
 
-# proxy_dict = {"http": "http://127.0.0.1", "https": "http://127.0.0.1"}
-# push_service = FCMNotification(
-#     api_key="AAAAicLngtE:APA91bEMDXGcE5suWeWd5JD1fJY1S2MJHdXMZYl4tbCCiHGfE5nvriAO05svXCJ4rBMd2aaDjtTfv5o0D9lrDfl9e2gKEIK_DbNKeCchESJ8Hk7Uj3FoxXvMa5_HOGAnrX7x60KvoMJ0",
-#     proxy_dict=proxy_dict,
-# )
+def allowed_file(filename):
+    return '.' in filename and filename.lower().rsplit('.', 1)[1] in ALLOWED_EXTENSIONS
 
 
 app = Flask(__name__)
 
-device = torch.device("cpu")
-model = torch.load("./model7.h5", map_location=device)
-# model.eval()
 
-dangerconds = []
+model = torch.load("./static/model8.h5")
 
+UPLOAD_FOLDER = './uploads/unknown'
+data_root = './uploads'
+test_dir = './uploads'
 
-def transform_image(image_bytes):
-    my_transforms = transforms.Compose(
-        [
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ]
-    )
-    image = Image.open(io.BytesIO(image_bytes))
-    return my_transforms(image).unsqueeze(0)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 
-def get_prediction(image_bytes):
-    tensor = transform_image(image_bytes=image_bytes)
+def get_prediction():
+     
+    val_transforms = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])  
+    test_dataset = ImageFolderWithPaths(test_dir, val_transforms)
+    #test_dataset = torchvision.datasets.ImageFolder(test_dir, val_transforms)
 
-    outputs = model.forward(tensor)
-    # model.eval()
-    gprob, pred = outputs.max(1)
-    prob = gprob.clone()
-    nnprob = prob.detach().numpy()[0]
-    print(nnprob)
-    result = "Fire_off"
-    if nnprob > 0.5 or nnprob < -0.25:
-        result = "Danger"
+    test_dataloader = torch.utils.data.DataLoader(
+        test_dataset, batch_size=2, shuffle=False, num_workers=0)
+    model.eval()
 
-    print(result)
-    if result == "Danger":
-        dangerconds.append(1)
-    else:
-        dangerconds.clear()
+    test_predictions = []
+    test_img_paths = []
+    for inputs, labels, paths in tqdm(test_dataloader):
+        #inputs = inputs.to(device)
+        #labels = labels.to(device)
+        with torch.set_grad_enabled(False):
+            preds = model(inputs)
+        test_predictions.append(
+            torch.nn.functional.softmax(preds, dim=1)[:,1].data.cpu().numpy())
+        test_img_paths.extend(paths)
+    
+    test_predictions = np.concatenate(test_predictions)
 
-    return result
-    # return imagenet_class_index[predicted_idx]
-
-
-@app.route("/predimg", methods=["POST"])
-def predimg():
-    if request.method == "POST":
-        jsonData = request.get_json()
-        file = jsonData["img"]
-        starter = file.find(",")
-        image_data = file[starter + 1 :]
-
-        image_data = bytes(image_data, encoding="ascii")
-        img_bytes = BytesIO(base64.b64decode(image_data))
-        im = Image.open(img_bytes)
-        # im.save("./image.jpg")
-        # return jsonify("OK")
-        class_name = get_prediction(image_bytes=base64.b64decode(image_data))
-        return jsonify({"class_name": class_name})
+    inputs, labels, paths = next(iter(test_dataloader))
+    submission_df = pd.DataFrame.from_dict({'id': test_img_paths, 'label': test_predictions})
+    submission_df['label'] = submission_df['label'].map(lambda pred: 'town' if pred > 0.5 else 'sun')
+    submission_df['id'] = submission_df['id'].str.replace('uploads/unknown/', '')
+    submission_df['id'] = submission_df['id'].str.replace('.jpg', '')    
+    return submission_df
 
 
-@app.route("/check")
-def check():
-    class_name = "Fire_off"
-    if len(dangerconds) > 3:
-        class_name = "Danger"
+@app.route('/', methods=['GET', 'POST'])
+def upload_file():
+    if request.method == 'POST':
+        file = request.files['file']
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+            #img = Image.open(io.BytesIO(file))
+            res = get_prediction()
+            print(res)
+            return redirect(url_for('uploaded_file',
+                                    filename=filename))
+    return '''
+    <!doctype html>
+    <head>
+    <title> DREAM TRIP</title>
+    </head>
+    <body>
+    <h1> Dream Trip project :</h1>
+    <p align=center><img src="\static\dream_trip_logo.png"
+        alt="Town trip"></p>
+    <p> Send foto of our dream place 
+    to server and server show you trip of your dream.</p>    
+    <title>Upload new File</title>
+    <h1>Upload new File</h1>
+    <form action="" method=post enctype=multipart/form-data>
+      <p><input type=file name=file>
+         <input type=submit value=Upload>
+    </form>
+    </body>
+    </html>
+    '''
 
-    return jsonify({"class_name": class_name})
+from flask import send_from_directory
 
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    print(UPLOAD_FOLDER)
+    return send_from_directory(app.config['UPLOAD_FOLDER'],
+                               filename)
 
-@app.route("/test")
-def test():
+#from werkzeug import SharedDataMiddleware
+#app.add_url_rule('/uploads/<filename>', 'uploaded_file',
+#                 build_only=True)
+#app.wsgi_app = SharedDataMiddleware(app.wsgi_app, {
+#    '/uploads':  app.config['UPLOAD_FOLDER']
+#})
 
-    # Your api-key can be gotten from:  https://console.firebase.google.com/project/sosclick/settings/cloudmessaging
-
-    # registration_id = "cHmvVSrhyaw:APA91bFmKwjvYyzugixggC2NWQTGdbbwz_XyOO-8Zcws4xfYPRvbTQRqKdyYBzKwOg8E9qIkBpauzEjYrilC9qKbec7FzU4_3PaM0uL8IsuoZrMXJ6dCmY3qxx04wLKK_g8-nqTu3U0P"
-    # message_title = "Uber update"
-    # message_body = "Hi john, your customized news for today is ready"
-    # result = push_service.notify_single_device(
-    #     registration_id=registration_id,
-    #     message_title=message_title,
-    #     message_body=message_body,
-    # )
-    # print(result)
-
-    return "OK"
-
-
-if __name__ == "__main__":
-    app.run() 
+if __name__ == '__main__':
+    app.run(debug=True) 
